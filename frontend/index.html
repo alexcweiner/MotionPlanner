@@ -364,6 +364,7 @@
     <section class="section">
       <h2>Keyframes</h2>
       <div class="flex" style="margin-bottom:8px;">
+        <select id="kfArm"><option value="arm">Arm 1</option><option value="arm2">Arm 2</option></select>
         <input type="text" id="kfName" placeholder="keyframe name">
         <select id="kfKind"><option value="pose">XYZ + orientation</option><option value="joints">Joints</option></select>
         <select id="kfGrip"><option value="none">none</option><option value="grab">grab</option><option value="open">open</option></select>
@@ -475,15 +476,24 @@ document.getElementById("btnStopSpeech").onclick = stopSpeech;
 
 /* ================= http ================= */
 async function api(path, opts = {}) {
-  const res = await fetch(API + path, {
-    headers: opts.body ? { "Content-Type": "application/json" } : {},
-    ...opts,
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => res.statusText);
-    throw new Error(`${res.status} ${txt}`);
+  // Time out reads only. Aborting a motion HTTP request does not stop the robot.
+  const read = !opts.method || opts.method.toUpperCase() === "GET";
+  const controller = read ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 8000) : null;
+  try {
+    const res = await fetch(API + path, {
+      headers: opts.body ? { "Content-Type": "application/json" } : {},
+      ...opts,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => res.statusText);
+      throw new Error(`${res.status} ${txt}`);
+    }
+    return await res.json();
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
-  return res.json();
 }
 
 function busy(show) {
@@ -520,7 +530,10 @@ function setStatus(id, text, kind = "idle") {
 }
 
 /* ================= connection ================= */
+let healthPending = false;
 async function checkHealth() {
+  if (document.hidden || healthPending) return;
+  healthPending = true;
   try {
     await api("/api/health");
     connected = true;
@@ -530,7 +543,7 @@ async function checkHealth() {
     connected = false;
     document.getElementById("connStatus").innerHTML = '<span class="dot off"></span>disconnected';
     document.getElementById("apiBadge").textContent = "api: down";
-  }
+  } finally { healthPending = false; }
 }
 checkHealth();
 setInterval(checkHealth, 5000);
@@ -564,7 +577,7 @@ async function loadArms() {
     usSel.innerHTML = '<option value="">(current pose)</option>';
     try {
       const poses = await api("/api/poses");
-      const arm2kf = (poses.poses.arm2 || []);
+      const arm2kf = (poses.poses.arm2?.keyframes || []);
       for (const kf of arm2kf) {
         const o = document.createElement("option");
         o.value = kf.name; o.textContent = kf.name;
@@ -580,17 +593,16 @@ loadArms();
 /* ================= STOP ALL ================= */
 document.getElementById("btnStopAll").onclick = async () => {
   try {
-    await api("/api/arm/arm/stop", { method: "POST" });
-    await api("/api/arm/arm2/stop", { method: "POST" });
-    await api("/api/unscrew/stop", { method: "POST" });
-    await api("/api/full_run/stop", { method: "POST" });
+    await api("/api/stop_all", { method: "POST" });
     log("STOP ALL: all arms and sequences stopped");
   } catch (e) { log("STOP ALL failed: " + e.message, "err"); }
 };
 
 /* ================= status polling ================= */
+let statusPending = false;
 async function pollStatus() {
-  if (!connected) return;
+  if (!connected || document.hidden || statusPending) return;
+  statusPending = true;
   try {
     const st = await api("/api/status");
     const a1 = st.arms.arm;
@@ -613,6 +625,7 @@ async function pollStatus() {
       document.getElementById("btnFullRunStop").disabled = true;
     }
   } catch (e) { /* ignore */ }
+  finally { statusPending = false; }
 }
 if (pollTimer) clearInterval(pollTimer);
 pollTimer = setInterval(pollStatus, POLL_MS);
@@ -672,7 +685,7 @@ function buildJointBox(arm, j, pos) {
 const jointPanels = new Map();
 let jointsRefreshing = false;
 async function refreshJoints() {
-  if (!connected || jointsRefreshing) return;
+  if (!connected || document.hidden || jointsRefreshing) return;
   jointsRefreshing = true;
   try {
     const data = await api("/api/arms");
@@ -809,23 +822,12 @@ document.getElementById("btnPickPlace").onclick = async () => {
 };
 
 document.getElementById("btnArm2Home").onclick = async () => {
-  const method = document.getElementById("approachMethod").value;
   busy(true);
   setBusyOverlay("busyArm2", true);
   setStatus("arm2Status", "moving home", "busy");
   try {
-    if (method === "vision") {
-      log("arm 2: vision mode — line-search cap instead of taught home");
-      const res = await api("/api/cap/line-search", { method: "POST", body: JSON.stringify({}) });
-      if (res.candidates && res.candidates.length > 0) {
-        const c = res.candidates[0];
-        log(`arm 2: line-search found cap at (${c.u}, ${c.v}) z ${c.z_mm.toFixed(0)} mm`);
-      } else {
-        log("arm 2: line-search found no cap candidates", "warn");
-      }
-    } else {
       const poses = await api("/api/poses");
-      const kf = (poses.poses.arm2 || []).find(k => k.name === "safe_bottle_start_pose");
+      const kf = (poses.poses.arm2?.keyframes || []).find(k => k.name === "safe_bottle_start_pose");
       if (!kf) throw new Error("no 'safe_bottle_start_pose' for arm2");
       if (kf.pose) {
         await api("/api/arm/arm2/move/position", { method: "POST", body: JSON.stringify(kf.pose) });
@@ -833,7 +835,6 @@ document.getElementById("btnArm2Home").onclick = async () => {
         await api("/api/arm/arm2/move/joints", { method: "POST", body: JSON.stringify({ values: kf.values }) });
       }
       log("arm 2: moved to safe_bottle_start_pose (taught)");
-    }
   } catch (e) { log("arm2 home failed: " + e.message, "err"); }
   finally { busy(false); setBusyOverlay("busyArm2", false); setStatus("arm2Status", "idle"); }
 };
@@ -861,8 +862,8 @@ document.getElementById("btnUnscrewDescribe").onclick = async () => {
   } catch (e) { log("unscrew describe failed: " + e.message, "err"); }
 };
 
-document.getElementById("btnUnscrew").onclick = async () => {
-  const req = {
+function unscrewParams() {
+  return {
     twists: parseInt(document.getElementById("usTwists").value) || 4,
     twist_deg: parseFloat(document.getElementById("usTwistDeg").value) || 120,
     final_lift_mm: parseFloat(document.getElementById("usFinalLift").value) || 30,
@@ -873,6 +874,10 @@ document.getElementById("btnUnscrew").onclick = async () => {
     loosen_sign: parseInt(document.getElementById("usDirection").value) || -1,
     start_pose: document.getElementById("usStartPose").value || "",
   };
+}
+
+document.getElementById("btnUnscrew").onclick = async () => {
+  const req = unscrewParams();
   busy(true);
   setBusyOverlay("busyUnscrew", true);
   setStatus("arm2Status", "unscrewing", "busy");
@@ -898,7 +903,7 @@ document.getElementById("btnFullRun").onclick = async () => {
   setStatus("arm1Status", "full run", "busy");
   document.getElementById("btnFullRunStop").disabled = false;
   try {
-    const res = await api("/api/full_run", { method: "POST" });
+    const res = await api("/api/full_run", { method: "POST", body: JSON.stringify({ unscrew: unscrewParams() }) });
     log(`full run complete: ${res.step}`);
   } catch (e) { log("full run failed: " + e.message, "err"); }
   finally { busy(false); setBusyOverlay("busyFullRun", false); setStatus("arm1Status", "idle"); document.getElementById("btnFullRunStop").disabled = true; }
@@ -912,14 +917,24 @@ document.getElementById("btnFullRunStop").onclick = async () => {
 };
 
 /* ================= keyframes ================= */
+function flatPoses(data) {
+  const flat = Object.entries(data.poses || {}).flatMap(([arm, group]) =>
+    (group.keyframes || []).map(k => ({ ...k, arm })));
+  const order = data.poses?.play_order || [];
+  const rank = k => {
+    const i = order.findIndex(o => o.arm === k.arm && o.name === k.name);
+    return i < 0 ? order.length : i;
+  };
+  return flat.sort((a, b) => rank(a) - rank(b));
+}
 async function loadPoses() {
   try {
     const data = await api("/api/poses");
     const tbody = document.querySelector("#kfTable tbody");
     tbody.innerHTML = "";
     let idx = 0;
-    for (const [arm, group] of Object.entries(data.poses || {})) {
-      for (const kf of group.keyframes || []) {
+    for (const kf of flatPoses(data)) {
+      const arm = kf.arm;
         const tr = document.createElement("tr");
         const v = kf.values ? kf.values.map(n => n.toFixed(1)).join(", ") :
                 (kf.pose ? `x ${kf.pose.x?.toFixed(0)} y ${kf.pose.y?.toFixed(0)} z ${kf.pose.z?.toFixed(0)}` : "—");
@@ -929,14 +944,13 @@ async function loadPoses() {
           <td>${arm}</td>
           <td class="mono">${v}</td>
           <td>${kf.gripper || "—"}</td>
-          <td><input type="number" value="${kf.delay || 0}" min="0" max="600" step="0.5" style="width:55px;" class="delayInput" data-name="${kf.name}"></td>
+          <td><input type="number" value="${kf.delay || 0}" min="0" max="600" step="0.5" style="width:55px;" class="delayInput" data-name="${kf.name}" data-arm="${arm}"></td>
           <td><button class="small" onclick="goKf('${arm}', ${JSON.stringify(kf).replace(/"/g, '&quot;')})">go</button></td>
           <td><button class="small" onclick="moveKfUp(${idx - 1})">↑</button></td>
           <td><button class="small" onclick="moveKfDown(${idx - 1})">↓</button></td>
           <td><button class="small danger" onclick="deleteKf(${idx - 1})">✕</button></td>
         `;
         tbody.appendChild(tr);
-      }
     }
     // wire delay inputs
     document.querySelectorAll(".delayInput").forEach(inp => {
@@ -944,18 +958,9 @@ async function loadPoses() {
         const name = inp.dataset.name;
         const val = parseFloat(inp.value) || 0;
         try {
-          await api("/api/poses/reorder", {
-            method: "POST",
-            body: JSON.stringify({ poses: (await api("/api/poses")).poses }) // placeholder - delays handled server side via save
-          });
-          // Actually save with delay: re-fetch poses, update delay, save
-          const pdata = await api("/api/poses");
-          let all = [];
-          for (const [a, g] of Object.entries(pdata.poses || {})) {
-            for (const k of g.keyframes || []) {
-              if (k.name === name) k.delay = val;
-              all.push(k);
-            }
+          const all = flatPoses(await api("/api/poses"));
+          for (const k of all) {
+            if (k.name === name && k.arm === inp.dataset.arm) k.delay = val;
           }
           await api("/api/poses/reorder", { method: "POST", body: JSON.stringify({ poses: all }) });
         } catch (e) { log("delay save failed: " + e.message, "err"); }
@@ -978,13 +983,9 @@ window.goKf = async (arm, kf) => {
 
 window.moveKfUp = async (i) => {
   try {
-    const poses = (await api("/api/poses/reorder", { method: "POST", body: JSON.stringify({ poses: (await api("/api/poses")).poses }) })) // no-op
     // get full list, swap, save
     const data = await api("/api/poses");
-    let all = [];
-    for (const [a, g] of Object.entries(data.poses || {})) {
-      for (const k of g.keyframes || []) all.push(k);
-    }
+    const all = flatPoses(data);
     if (i > 0) { [all[i-1], all[i]] = [all[i], all[i-1]]; await api("/api/poses/reorder", { method: "POST", body: JSON.stringify({ poses: all }) }); await loadPoses(); }
   } catch (e) { log("reorder failed: " + e.message, "err"); }
 };
@@ -992,10 +993,7 @@ window.moveKfUp = async (i) => {
 window.moveKfDown = async (i) => {
   try {
     const data = await api("/api/poses");
-    let all = [];
-    for (const [a, g] of Object.entries(data.poses || {})) {
-      for (const k of g.keyframes || []) all.push(k);
-    }
+    const all = flatPoses(data);
     if (i < all.length - 1) { [all[i], all[i+1]] = [all[i+1], all[i]]; await api("/api/poses/reorder", { method: "POST", body: JSON.stringify({ poses: all }) }); await loadPoses(); }
   } catch (e) { log("reorder failed: " + e.message, "err"); }
 };
@@ -1003,10 +1001,7 @@ window.moveKfDown = async (i) => {
 window.deleteKf = async (i) => {
   try {
     const data = await api("/api/poses");
-    let all = [];
-    for (const [a, g] of Object.entries(data.poses || {})) {
-      for (const k of g.keyframes || []) all.push(k);
-    }
+    const all = flatPoses(data);
     all.splice(i, 1);
     await api("/api/poses/reorder", { method: "POST", body: JSON.stringify({ poses: all }) });
     await loadPoses();
@@ -1020,15 +1015,15 @@ document.getElementById("btnSaveKf").onclick = async () => {
   const name = document.getElementById("kfName").value.trim();
   if (!name) { log("give the keyframe a name", "warn"); return; }
   try {
-    const arms = (await api("/api/arms")).arms;
-    const arm = arms[0] || "arm";
+    const arm = document.getElementById("kfArm").value;
     const kind = document.getElementById("kfKind").value;
     const grip = document.getElementById("kfGrip").value;
     const delay = parseFloat(document.getElementById("kfDelay").value) || 0;
     const payload = { arm, name, kind, gripper: grip === "none" ? null : grip, delay };
     if (kind === "pose") {
       const pos = await api(`/api/arm/${arm}/position`);
-      payload.pose = pos;
+      const { arm: ignoredArm, ...pose } = pos;
+      payload.pose = pose;
     } else {
       const j = await api(`/api/arm/${arm}/joints`);
       payload.values = j.values;
@@ -1049,12 +1044,12 @@ async function runSequence(kind) {
     const data = await api("/api/poses");
     let keyframes = [];
     if (kind === "arm1") {
-      keyframes = (data.poses.arm || []).map(k => ({ ...k, arm: "arm" }));
+      keyframes = (data.poses.arm?.keyframes || []).map(k => ({ ...k, arm: "arm" }));
     } else if (kind === "arm2") {
-      keyframes = (data.poses.arm2 || []).map(k => ({ ...k, arm: "arm2" }));
+      keyframes = (data.poses.arm2?.keyframes || []).map(k => ({ ...k, arm: "arm2" }));
     } else {
-      keyframes = [...(data.poses.arm || []), ...(data.poses.arm2 || [])]
-        .map(k => ({ ...k, arm: k.arm || "arm" }));
+      const all = flatPoses(data);
+      keyframes = [...all.filter(k => k.arm === "arm"), ...all.filter(k => k.arm === "arm2")];
     }
     await api("/api/poses/run", { method: "POST", body: JSON.stringify({ keyframes }) });
     log(`sequence "${kind}" complete: ${keyframes.length} steps`);
@@ -1067,11 +1062,14 @@ document.getElementById("btnRunArm2").onclick = () => runSequence("arm2");
 document.getElementById("btnRunBoth").onclick = () => runSequence("both");
 
 /* ================= camera ================= */
+let cameraPending = false;
 async function refreshCam() {
+  if (document.hidden || cameraPending) return;
   const sel = document.getElementById("camSelect");
   const cam = sel.value;
   const view = document.getElementById("camView").value;
   if (!cam) return;
+  cameraPending = true;
   const endpoint = view === "depth" ? `/api/camera/${cam}/frame` : `/api/camera/${cam}/preview`;
   try {
     const data = await api(endpoint);
@@ -1083,6 +1081,7 @@ async function refreshCam() {
     document.getElementById("camEmpty").style.display = "block";
     document.getElementById("camImg").style.display = "none";
   }
+  finally { cameraPending = false; }
 }
 document.getElementById("btnCamToggle").onclick = async () => {
   camPreviewOn = !camPreviewOn;
@@ -1195,9 +1194,10 @@ async function capDetect() {
       wrap.appendChild(img);
     }
     let html = `<div class="metric">Circles found: <span class="val">${res.circles.length}</span> · rejected: <span class="val">${res.rejected.length}</span></div>`;
+    window.lastCircle = null;
     if (res.circles.length > 0) {
       const c = res.circles[0];
-      window.lastCircle = { u: c.u, v: c.v, r: c.r };
+      window.lastCircle = { u: c.u, v: c.v, r: c.r, x: c.x, y: c.y, z: c.z };
       html += `<div class="metric ok">Using circle #1: (${c.u}, ${c.v}) r ${c.r} px for align</div>`;
     }
     res.circles.forEach((c, i) => {
@@ -1264,7 +1264,7 @@ async function alignPlan() {
   const c = window.lastCircle;
   if (!c) { log("No circle detected. Run Detect cap first.", "warn"); return; }
   const req = {
-    circle_x: c.u, circle_y: c.v, circle_r: c.r,
+    circle_x: c.x, circle_y: c.y, circle_z: c.z, circle_r: c.r,
     hover: parseFloat(document.getElementById("alHover").value) || 80,
     keep_height: document.getElementById("alKeepH").checked,
   };
@@ -1284,7 +1284,7 @@ async function alignPlan() {
 async function alignMove() {
   if (!window.lastCircle || !window.lastCircle.plan) { log("No align plan. Click Compute align plan first.", "warn"); return; }
   const req = {
-    circle_x: window.lastCircle.u, circle_y: window.lastCircle.v, circle_r: window.lastCircle.r,
+    circle_x: window.lastCircle.x, circle_y: window.lastCircle.y, circle_z: window.lastCircle.z, circle_r: window.lastCircle.r,
     hover: parseFloat(document.getElementById("alHover").value) || 80,
     keep_height: document.getElementById("alKeepH").checked,
   };

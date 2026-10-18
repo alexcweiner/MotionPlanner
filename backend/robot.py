@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from contextlib import contextmanager
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,36 @@ API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "")
 API_KEY = os.environ.get("VIAM_API_KEY", "")
 
 RIGS = {"arm": ("cam", "gripper"), "arm2": ("cam2", "gripper2")}
+
+
+_motion_lock = threading.Lock()
+_motion_context = threading.local()
+_stop_generation = 0
+
+
+def cancel_motion():
+    """Invalidate in-flight HTTP motion routines before sending hardware stops."""
+    global _stop_generation
+    _stop_generation += 1
+
+
+def check_motion():
+    generation = getattr(_motion_context, "generation", _stop_generation)
+    if generation != _stop_generation:
+        raise InterruptedError("Motion stopped; no further steps will run")
+
+
+@contextmanager
+def motion_session():
+    if not _motion_lock.acquire(blocking=False):
+        raise RuntimeError("Another motion operation is running")
+    _motion_context.generation = _stop_generation
+    try:
+        yield
+        check_motion()
+    finally:
+        del _motion_context.generation
+        _motion_lock.release()
 
 
 class Robot:
@@ -146,12 +177,14 @@ def end_position(name: str) -> dict[str, float]:
 
 def move_joint_positions(name: str, values: list[float]) -> None:
     """Move an arm to joint positions (joint-space move)."""
+    check_motion()
     run(_robot.arm(name).move_to_joint_positions(JointPositions(values=list(values))))
 
 
 def move_position(name: str, x: float, y: float, z: float,
                   o_x: float, o_y: float, o_z: float, theta: float) -> None:
     """Move an arm to a Cartesian pose via the motion planner."""
+    check_motion()
     run(_robot.arm(name).move_to_position(
         Pose(x=x, y=y, z=z, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta)
     ))
@@ -159,6 +192,7 @@ def move_position(name: str, x: float, y: float, z: float,
 
 def gripper_action(arm_name: str, action: str) -> bool | None:
     """Grab or open the gripper on an arm. Returns True/False for grab, None for open."""
+    check_motion()
     grip_name = RIGS[arm_name][1]
     if action == "grab":
         return run(_robot.gripper(grip_name).grab())
@@ -179,10 +213,10 @@ def gripper_do_command(arm_name: str, command: dict) -> None:
     run(_robot.gripper(grip_name).do_command(command))
 
 
-def transform_pose(src_frame: str, pose_dict: dict, dst_frame: str) -> dict:
+def transform_pose(src_frame: str, pose_dict: dict, dst_frame: str, extra=None) -> dict:
     """Transform a pose from src_frame to dst_frame using the machine's frame system."""
     q = PoseInFrame(reference_frame=src_frame, pose=Pose(**pose_dict))
-    r = run(_robot.transform_pose(q, dst_frame)).pose
+    r = run(_robot._sync_robot().transform_pose(q, dst_frame, extra)).pose
     return {"x": float(r.x), "y": float(r.y), "z": float(r.z),
             "o_x": float(r.o_x), "o_y": float(r.o_y), "o_z": float(r.o_z), "theta": float(r.theta)}
 
@@ -228,7 +262,7 @@ def world_point(frame_name: str, x: float = 0.0, y: float = 0.0, z: float = 0.0)
     """A point given in `frame_name` -> world coordinates (mm)."""
     q = PoseInFrame(reference_frame=frame_name,
                     pose=Pose(x=x, y=y, z=z, o_x=0, o_y=0, o_z=1, theta=0))
-    r = run(_robot.transform_pose(q, "world")).pose
+    r = run(_robot._sync_robot().transform_pose(q, "world")).pose
     return np.array([r.x, r.y, r.z])
 
 
@@ -237,7 +271,8 @@ def capture_frame(cam_name: str, cam_frame: str, arm_name: str) -> dict:
 
     async def grab():
         cam = _robot.camera(cam_name)
-        images, props = await cam.get_images(), await cam.get_properties()
+        images, _ = await cam.get_images()
+        props = await cam.get_properties()
         return images, props
 
     images, props = run(grab())
@@ -307,11 +342,11 @@ def _row_width_px(cap, box, v, z, radius):
 
 
 def _surface_to_world(cap, det, z, radius):
-    px = det["px"]
-    u, v = px
-    Zc = z + radius
-    p = np.array([(u - cap["cx"]) / cap["fx"] * Zc, (v - cap["cy"]) / cap["fy"] * Zc, Zc])
-    return cap["origin"] + cap["R"] @ p
+    u, v = det["px"]
+    surface = np.array([(u - cap["cx"]) / cap["fx"] * z, (v - cap["cy"]) / cap["fy"] * z, z])
+    axis = surface + radius * surface / np.linalg.norm(surface)
+    return cap["origin"] + cap["R"] @ axis
+
 
 
 def yolo_detect(service_name: str, jpeg_bytes: bytes) -> list[dict]:

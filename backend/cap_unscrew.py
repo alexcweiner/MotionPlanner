@@ -13,7 +13,7 @@ import numpy as np
 from viam.proto.common import Pose, PoseInFrame, Transform
 
 from robot import (
-    arm_do_command, arm_stop, end_position, gripper_action, gripper_do_command,
+    arm_do_command, arm_stop, gripper_stop, end_position, gripper_action, gripper_do_command,
     joints, move_joint_positions, move_position, transform_pose,
 )
 
@@ -88,11 +88,11 @@ class Unscrewer:
         return None
 
     # ---------- leveling geometry (frame system; nothing here moves) ----------
-    def _tf(self, src, pose_dict, dst):
-        return transform_pose(src, pose_dict, dst)
+    def _tf(self, src, pose_dict, dst, extra=None):
+        return transform_pose(src, pose_dict, dst, extra)
 
     def _point(self, src, x=0.0, y=0.0, z=0.0, dst=None, extra=None):
-        p = self._tf(src, {"x": x, "y": y, "z": z, "o_z": 1.0}, dst or self.base)
+        p = self._tf(src, {"x": x, "y": y, "z": z, "o_z": 1.0}, dst or self.base, extra)
         return np.array([p["x"], p["y"], p["z"]])
 
     @staticmethod
@@ -105,8 +105,8 @@ class Unscrewer:
     def level_plan(self, max_tilt_deg, tool=None, extra=None):
         tool = tool or self.arm_name
         L = self.tool_length()
-        flange = self._point(tool)
-        below = self._point(self.base, *(flange - [0, 0, 100]), dst=tool)
+        flange = self._point(tool, extra=extra)
+        below = self._point(self.base, *(flange - [0, 0, 100]), dst=tool, extra=extra)
         d = below / np.linalg.norm(below)
         tilt = math.degrees(math.acos(max(-1.0, min(1.0, d[2]))))
         if tilt > max_tilt_deg:
@@ -117,13 +117,13 @@ class Unscrewer:
         lon = math.degrees(math.atan2(d[1], d[0]))
         rel = Pose(x=-L * d[0], y=-L * d[1], z=L * (1 - d[2]), o_x=d[0], o_y=d[1], o_z=d[2], theta=-lon)
         target = self._tf(tool, {"x": rel.x, "y": rel.y, "z": rel.z,
-                                 "o_x": rel.o_x, "o_y": rel.o_y, "o_z": rel.o_z, "theta": rel.theta}, self.base)
+                                 "o_x": rel.o_x, "o_y": rel.o_y, "o_z": rel.o_z, "theta": rel.theta}, self.base, extra)
         vt = [Transform(reference_frame=_LEVEL_FRAME,
-                        pose_in_observer_frame=PoseInFrame(reference_frame=tool, pose=rel))]
+                        pose_in_observer_frame=PoseInFrame(reference_frame=tool, pose=rel))] + list(extra or [])
         origin_new = self._point(_LEVEL_FRAME, extra=vt)
         axis_new = self._point(_LEVEL_FRAME, z=100, extra=vt) - origin_new
-        pivot_shift = np.linalg.norm(self._point(_LEVEL_FRAME, z=L, extra=vt) - self._point(tool, z=L))
-        x_old = self._point(tool, x=100) - flange
+        pivot_shift = np.linalg.norm(self._point(_LEVEL_FRAME, z=L, extra=vt) - self._point(tool, z=L, extra=extra))
+        x_old = self._point(tool, x=100, extra=extra) - flange
         x_new = self._point(_LEVEL_FRAME, x=100, extra=vt) - origin_new
         roll = abs((math.degrees(math.atan2(x_new[1], x_new[0]) - math.atan2(x_old[1], x_old[0])) + 180) % 360 - 180)
         down_err = math.degrees(math.acos(max(-1.0, min(1.0, -axis_new[2] / 100))))
@@ -150,7 +150,6 @@ class Unscrewer:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=10)
-        self._thread = None
 
     # ---------- internals ----------
     def _set(self, **kw):

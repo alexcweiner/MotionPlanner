@@ -61,3 +61,34 @@ def test_authenticated_connection_and_resource_listing(monkeypatch):
     assert opts.dial_options.credentials.payload == 'test-key'
     robot.disconnect()
     fake.close.assert_awaited_once()
+
+
+def test_capture_unpacks_images_and_uses_client_transforms(monkeypatch):
+    import cv2
+    import numpy as np
+    from viam.media.video import NamedImage, CameraMimeType
+
+    _, encoded = cv2.imencode('.png', np.zeros((2, 3, 3), dtype=np.uint8))
+    color = NamedImage('color', encoded.tobytes(), CameraMimeType.PNG)
+    depth = SimpleNamespace(mime_type='image/vnd.viam.dep', name='depth',
+                            bytes_to_depth_array=lambda: [[100, 200, 300], [400, 500, 600]])
+    camera = SimpleNamespace(
+        get_images=AsyncMock(return_value=([color, depth], object())),
+        get_properties=AsyncMock(return_value=SimpleNamespace(intrinsic_parameters=SimpleNamespace(
+            focal_x_px=100, focal_y_px=100, center_x_px=1, center_y_px=1))))
+
+    async def transform(q, destination):
+        assert destination == 'world'
+        return q
+
+    client = SimpleNamespace(transform_pose=AsyncMock(side_effect=transform))
+    wrapper = robot.Robot()
+    wrapper._robot = client
+    monkeypatch.setattr(wrapper, 'camera', lambda name: camera)
+    monkeypatch.setattr(robot, '_robot', wrapper)
+    frame = robot.capture_frame('cam', 'cam', 'arm')
+    assert frame['bgr'].shape == (2, 3, 3)
+    assert frame['depth_matches_color']
+    assert frame['depth'][1, 2] == 600
+    np.testing.assert_array_equal(frame['R'], np.eye(3))
+    assert client.transform_pose.await_count == 4

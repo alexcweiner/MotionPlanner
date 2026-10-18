@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import time
+from functools import wraps
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,7 @@ from robot import (
     move_position, gripper_action, camera_frame, list_arm_names,
     list_all_resource_names, arm_stop, gripper_stop, transform_pose,
     world_point, capture_frame, yolo_detect, run as viam_run,
+    motion_session, cancel_motion, check_motion,
 )
 _ROBOT = None
 def _get_robot():
@@ -51,11 +53,17 @@ sequence = _poses_io.sequence
 load_poses = _poses_io.load
 save_poses = _poses_io.save
 
+_cap_spec = importlib.util.spec_from_file_location("shared_cap_vision", _REPO_ROOT / "cap_vision.py")
+_cap_vision = importlib.util.module_from_spec(_cap_spec)
+_cap_spec.loader.exec_module(_cap_vision)
+
 app = FastAPI(title="Viam Bottle Opener Backend")
 
 # Resolve paths relative to this file so cwd doesn't matter.
 BACKEND_DIR = Path(__file__).resolve().parent
 POSES_FILE = Path(os.environ.get("POSES_FILE", str(_REPO_ROOT / "poses.json")))
+if not POSES_FILE.is_absolute():
+    POSES_FILE = BACKEND_DIR / POSES_FILE
 
 # Singletons (created at startup after robot connects)
 _UNSCREWER: Unscrewer | None = None
@@ -63,6 +71,37 @@ _BOTTLE_TASK: BottleTask | None = None
 
 # YOLO step-by-step state (persists between HTTP requests, like Streamlit session state)
 YOLO_STATE = {"meas": None, "plan": None, "cfg": None}
+
+
+def motion_endpoint(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            with motion_session():
+                return fn(*args, **kwargs)
+        except (RuntimeError, InterruptedError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    return wrapped
+
+
+@app.post("/api/stop_all")
+def api_stop_all():
+    cancel_motion()
+    # Signal the sequence threads before stopping hardware, so they cannot
+    # advance while the stop requests are being processed.
+    for task in (_BOTTLE_TASK, _UNSCREWER):
+        if task is not None:
+            task._stop.set()
+    errors = []
+    for name in ("arm", "arm2"):
+        for stop in (arm_stop, gripper_stop):
+            try:
+                stop(name)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+    if errors:
+        raise HTTPException(status_code=500, detail="; ".join(errors))
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +182,7 @@ class AlignPlan(BaseModel):
     circle_x: float
     circle_y: float
     circle_r: float
+    circle_z: float
     hover: float = 80.0
     keep_height: bool = True
 
@@ -259,7 +299,8 @@ def api_position(name: str) -> dict[str, Any]:
 
 
 @app.post("/api/arm/{name}/move/joints")
-def api_move_joints(name: str, move: JointMove) -> dict[str, str]:
+@motion_endpoint
+def api_move_joints(name: str, move: JointMove) -> dict[str, Any]:
     if len(move.values) != 6:
         raise HTTPException(status_code=400, detail="Expected 6 joint values")
     try:
@@ -270,7 +311,8 @@ def api_move_joints(name: str, move: JointMove) -> dict[str, str]:
 
 
 @app.post("/api/arm/{name}/move/position")
-def api_move_position(name: str, move: PoseMove) -> dict[str, str]:
+@motion_endpoint
+def api_move_position(name: str, move: PoseMove) -> dict[str, Any]:
     try:
         move_position(name, move.x, move.y, move.z, move.o_x, move.o_y, move.o_z, move.theta)
         return {"status": "ok", "arm": name}
@@ -279,7 +321,8 @@ def api_move_position(name: str, move: PoseMove) -> dict[str, str]:
 
 
 @app.post("/api/arm/{name}/gripper/{action}")
-def api_gripper(name: str, action: str) -> dict[str, str]:
+@motion_endpoint
+def api_gripper(name: str, action: str) -> dict[str, Any]:
     if action not in ("grab", "open"):
         raise HTTPException(status_code=400, detail="action must be 'grab' or 'open'")
     try:
@@ -290,7 +333,8 @@ def api_gripper(name: str, action: str) -> dict[str, str]:
 
 
 @app.post("/api/arm/{name}/stop")
-def api_arm_stop(name: str) -> dict[str, str]:
+def api_arm_stop(name: str) -> dict[str, Any]:
+    cancel_motion()
     try:
         arm_stop(name)
         gripper_stop(name)
@@ -311,10 +355,12 @@ def api_poses() -> dict[str, Any]:
 
 
 @app.post("/api/poses/run")
-def api_run_poses(seq: RunSequence) -> dict[str, str]:
+@motion_endpoint
+def api_run_poses(seq: RunSequence) -> dict[str, Any]:
     """Play a list of keyframes in order, one arm at a time (blocking)."""
     try:
         for kf in seq.keyframes:
+            check_motion()
             arm_name = kf.arm
             d = kf.model_dump()
             if d.get("pose") is not None:
@@ -337,16 +383,27 @@ def api_run_poses(seq: RunSequence) -> dict[str, str]:
 # YOLO pick & place (arm 1)
 # ---------------------------------------------------------------------------
 @app.post("/api/pick_and_place")
-def api_pick_and_place() -> dict[str, str]:
+@motion_endpoint
+def api_pick_and_place() -> dict[str, Any]:
     """Run the full YOLO pick & place on arm 1 (blocking)."""
     try:
         cfg = dict(YOLO_DEFAULTS)
+        keyframes = load_poses(POSES_FILE)
+        targets = {}
+        for name in ("NewMid", "parking"):
+            frame = next((p for p in keyframes
+                          if p.get("arm") == "arm" and p.get("name") == name), None)
+            values = frame.get("values") if frame else None
+            if (not isinstance(values, list) or len(values) != 6
+                    or not all(isinstance(v, (int, float)) and np.isfinite(v) for v in values)):
+                raise ValueError(f"Arm 1 needs a {name} keyframe with six finite joint angles")
+            targets[name] = values
         result = yg_pick_and_place(
             arm_name="arm", gripper_name="gripper",
             cam_name="cam", cam_frame="cam", grip_frame="gripper",
-            newmid=[-64.7, 11.8, -54.1, 107.2, 72.4, 218.7],
-            parking=[-34.8, -75.8, -2.9, 164.9, 9.4, 194.1],
-            cfg=cfg,
+            newmid=targets["NewMid"],
+            parking=targets["parking"],
+            cfg=cfg, check=check_motion,
         )
         return {"status": "ok", "frames": result[0]["frames"], "width_mm": result[0]["width_mm"]}
     except Exception as exc:
@@ -354,7 +411,8 @@ def api_pick_and_place() -> dict[str, str]:
 
 
 @app.post("/api/reset_arm1")
-def api_reset_arm1() -> dict[str, str]:
+@motion_endpoint
+def api_reset_arm1() -> dict[str, Any]:
     """Reset arm 1: open gripper, move to parking keyframe."""
     try:
         parking = next((p for p in load_poses(POSES_FILE)
@@ -363,7 +421,7 @@ def api_reset_arm1() -> dict[str, str]:
             raise ValueError("Arm 1 needs a parking keyframe with six joint angles")
         yg_reset_arm(
             arm_name="arm", gripper_name="gripper",
-            parking=parking["values"],
+            parking=parking["values"], check=check_motion,
         )
         return {"status": "ok"}
     except Exception as exc:
@@ -374,7 +432,8 @@ def api_reset_arm1() -> dict[str, str]:
 # Unscrew (arm 2)
 # ---------------------------------------------------------------------------
 @app.post("/api/unscrew")
-def api_unscrew(req: UnscrewRequest | None = None) -> dict[str, str]:
+@motion_endpoint
+def api_unscrew(req: UnscrewRequest | None = None) -> dict[str, Any]:
     """Run the cap unscrew sequence on arm 2 (blocking)."""
     if _UNSCREWER is None:
         raise HTTPException(status_code=500, detail="Unscrewer not initialized")
@@ -382,6 +441,13 @@ def api_unscrew(req: UnscrewRequest | None = None) -> dict[str, str]:
         raise HTTPException(status_code=409, detail="Unscrew already running")
     try:
         p = UnscrewParams(**(req.model_dump() if req else {}))
+        if p.start_pose:
+            frame = next((k for k in load_poses(POSES_FILE)
+                          if k["arm"] == "arm2" and k["name"] == p.start_pose), None)
+            if frame is None:
+                raise ValueError("Unknown arm2 start pose: " + p.start_pose)
+            p.start_joints = tuple(frame.get("values") or ())
+            p.start_target = tuple(frame["pose"][k] for k in ("x", "y", "z", "o_x", "o_y", "o_z", "theta")) if frame.get("pose") else ()
         _UNSCREWER.start(p)
         # Wait for completion (blocking endpoint)
         while _UNSCREWER.running:
@@ -404,7 +470,7 @@ def api_unscrew_describe() -> dict[str, Any]:
 
 
 @app.post("/api/unscrew/stop")
-def api_unscrew_stop() -> dict[str, str]:
+def api_unscrew_stop() -> dict[str, Any]:
     if _UNSCREWER:
         _UNSCREWER.stop()
     return {"status": "ok"}
@@ -414,15 +480,20 @@ def api_unscrew_stop() -> dict[str, str]:
 # Full run (arm's keyframes -> arm2 keyframes -> unscrew -> retreat -> drop)
 # ---------------------------------------------------------------------------
 @app.post("/api/full_run")
-def api_full_run(req: FullRunRequest | None = None) -> dict[str, str]:
+@motion_endpoint
+def api_full_run(req: FullRunRequest | None = None) -> dict[str, Any]:
     """Run the complete bottle-opening sequence (blocking)."""
     if _BOTTLE_TASK is None:
         raise HTTPException(status_code=500, detail="BottleTask not initialized")
     if _BOTTLE_TASK.running:
         raise HTTPException(status_code=409, detail="Full run already running")
     try:
-        all_kf = load_poses()
+        all_kf = load_poses(POSES_FILE)
         keyframes = sequence(all_kf, "arm_then_arm2")
+        required = {"safe_bottle_start_pose", "open_bottle_cap_pose", "open_bottle_cap_up_pose", "trash_drop_pose"}
+        missing = required - {k["name"] for k in keyframes if k["arm"] == "arm2"}
+        if missing:
+            raise ValueError("Missing arm2 keyframes: " + ", ".join(sorted(missing)))
         # Remove trash_drop from keyframe list (it's handled separately as drop)
         drop_kf = next((k for k in keyframes if k["arm"] == "arm2" and k["name"] == "trash_drop_pose"), None)
         pre_kf = [k for k in keyframes if k != drop_kf]
@@ -431,10 +502,13 @@ def api_full_run(req: FullRunRequest | None = None) -> dict[str, str]:
         if alongside is not None and pre_kf and pre_kf[0]["arm"] != "arm2":
             pre_kf.remove(alongside)
         # via: safe_bottle_start_pose (move only, after unscrew)
-        via = [k for k in pre_kf if k["arm"] == "arm2" and k["name"] == "safe_bottle_start_pose"]
+        via = [k for k in keyframes if k["arm"] == "arm2" and k["name"] == "safe_bottle_start_pose"]
         # retreat: open_bottle_cap_up_pose (rise up holding cap)
         retreat = next((k for k in pre_kf if k["arm"] == "arm2" and k["name"] == "open_bottle_cap_up_pose"), None)
         p = UnscrewParams(**(req.unscrew.model_dump() if req and req.unscrew else {}))
+        p.start_joints = ()
+        p.start_target = ()
+        p.start_pose = ""
         _BOTTLE_TASK.start(pre_kf, p, drop_kf, retreat, via, alongside)
         while _BOTTLE_TASK.running:
             time.sleep(0.1)
@@ -449,7 +523,7 @@ def api_full_run(req: FullRunRequest | None = None) -> dict[str, str]:
 
 
 @app.post("/api/full_run/stop")
-def api_full_run_stop() -> dict[str, str]:
+def api_full_run_stop() -> dict[str, Any]:
     if _BOTTLE_TASK:
         _BOTTLE_TASK.stop()
     return {"status": "ok"}
@@ -480,10 +554,10 @@ def api_status() -> dict[str, Any]:
 # Keyframes: save, reorder, delete
 # ---------------------------------------------------------------------------
 @app.post("/api/poses/save")
-def api_save_pose(sp: SavePose) -> dict[str, str]:
+def api_save_pose(sp: SavePose) -> dict[str, Any]:
     try:
-        poses = load_poses()
-        poses = [p for p in poses if p.get("name") != sp.name]
+        poses = load_poses(POSES_FILE)
+        poses = [p for p in poses if (p.get("arm"), p.get("name")) != (sp.arm, sp.name)]
         entry = {"arm": sp.arm, "name": sp.name}
         if sp.kind == "pose" and sp.pose is not None:
             entry["pose"] = sp.pose
@@ -501,7 +575,7 @@ def api_save_pose(sp: SavePose) -> dict[str, str]:
 
 
 @app.post("/api/poses/reorder")
-def api_reorder_poses(rp: ReorderPoses) -> dict[str, str]:
+def api_reorder_poses(rp: ReorderPoses) -> dict[str, Any]:
     try:
         poses = rp.poses
         for p in poses:
@@ -548,7 +622,8 @@ def api_yolo_locate(req: YoloLocate | None = None) -> dict[str, Any]:
 
 
 @app.post("/api/yolo/move")
-def api_yolo_move(req: YoloMove) -> dict[str, str]:
+@motion_endpoint
+def api_yolo_move(req: YoloMove) -> dict[str, Any]:
     try:
         plan = YOLO_STATE["plan"]
         meas = YOLO_STATE["meas"]
@@ -556,10 +631,24 @@ def api_yolo_move(req: YoloMove) -> dict[str, str]:
         if plan is None or meas is None:
             raise HTTPException(status_code=400, detail="Locate the bottle first.")
         kind = req.kind
+        errors = [text for level, text in plan["checks"] if level == "error"]
+        if kind in ("pre", "grab") and errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+        if kind in ("pre", "grab"):
+            now = end_position("arm")
+            expected = meas["end"] if kind == "pre" else plan["pre"]
+            distance = np.linalg.norm([now[k] - expected[k] for k in ("x", "y", "z")])
+            same_orientation = (np.allclose([now[k] for k in ("o_x", "o_y", "o_z")],
+                                           [expected[k] for k in ("o_x", "o_y", "o_z")], atol=0.01)
+                                and abs((now["theta"] - expected["theta"] + 180) % 360 - 180) < 1.0)
+            if distance > (2 if kind == "pre" else 5) or not same_orientation:
+                detail = "Arm moved since Locate; locate again" if kind == "pre" else "Go to the pre-grasp first"
+                raise HTTPException(status_code=400, detail=detail)
         if kind == "pre":
             gripper_action("arm", "open")
             _straight("arm", plan["pre"], cfg["pre_step_mm"])
         elif kind == "grab":
+            gripper_action("arm", "open")
             _straight("arm", plan["grab"], cfg["in_step_mm"])
             held = gripper_action("arm", "grab")
             if held is False:
@@ -584,7 +673,8 @@ def api_yolo_move(req: YoloMove) -> dict[str, str]:
 
 
 @app.post("/api/yolo/nudge")
-def api_yolo_nudge(req: Nudge) -> dict[str, str]:
+@motion_endpoint
+def api_yolo_nudge(req: Nudge) -> dict[str, Any]:
     try:
         e = end_position("arm")
         a = _unit([e["o_x"], e["o_y"], e["o_z"]])
@@ -605,7 +695,8 @@ def api_yolo_nudge(req: Nudge) -> dict[str, str]:
 
 
 @app.post("/api/yolo/level")
-def api_yolo_level(_: LevelGripper) -> dict[str, str]:
+@motion_endpoint
+def api_yolo_level(_: LevelGripper | None = None) -> dict[str, Any]:
     try:
         e = end_position("arm")
         PIVOT_MM = 105.0 + YOLO_DEFAULTS["pad_mm"]
@@ -618,7 +709,8 @@ def api_yolo_level(_: LevelGripper) -> dict[str, str]:
 
 
 @app.post("/api/yolo/yaw")
-def api_yolo_yaw(req: Yaw) -> dict[str, str]:
+@motion_endpoint
+def api_yolo_yaw(req: Yaw) -> dict[str, Any]:
     try:
         e = end_position("arm")
         PIVOT_MM = 105.0 + YOLO_DEFAULTS["pad_mm"]
@@ -656,17 +748,20 @@ def api_yolo_state() -> dict[str, Any]:
 @app.post("/api/cap/detect")
 def api_cap_detect(req: CapDetect | None = None) -> dict[str, Any]:
     try:
-        from cap_vision import detect_circles as cv_detect_circles, measure as cv_measure
+        from types import SimpleNamespace
+        cv_detect_circles = _cap_vision.detect_circles
         import cv2
         from robot import capture_frame
         cap = capture_frame("cam2", "cam2", "arm2")
         bgr = cap["bgr"]
         depth = cap["depth"]
+        vision = _cap_vision.CapVision(None, None, None, None, SimpleNamespace(
+            focal_x_px=cap["fx"], focal_y_px=cap["fy"], center_x_px=cap["cx"], center_y_px=cap["cy"]))
         detect = (req.min_r, req.max_r, req.sensitivity, req.min_silver, req.min_rim) if req else (40, 250, 50, 0.5, 0.55)
         circles, rejected = cv_detect_circles(bgr, *detect)
         result = {"circles": [], "rejected": []}
         for u, v, r, _ in circles:
-            p = cv_measure((u, v, r), depth, req.cap_d if req else 30.0)
+            p = vision.measure((u, v, r, 0), depth, req.cap_d if req else 30.0)
             result["circles"].append({
                 "u": round(u, 1), "v": round(v, 1), "r": round(r, 1),
                 "x": round(p["x"], 1), "y": round(p["y"], 1), "z": round(p["z"], 1),
@@ -674,8 +769,7 @@ def api_cap_detect(req: CapDetect | None = None) -> dict[str, Any]:
             })
         for u, v, r, _ in rejected:
             result["rejected"].append({"u": round(u, 1), "v": round(v, 1), "r": round(r, 1)})
-        from cap_vision import annotate as cv_annotate
-        img = cv_annotate(bgr, circles, rejected)
+        img = cv2.cvtColor(vision.annotate(bgr, circles, rejected), cv2.COLOR_RGB2BGR)
         ok, enc = cv2.imencode(".jpg", img)
         result["jpeg_base64"] = base64.b64encode(enc.tobytes()).decode("ascii") if ok else None
         return result
@@ -772,7 +866,7 @@ def api_align_plan(req: AlignPlan) -> dict[str, Any]:
     try:
         import numpy as np
         from robot import transform_pose
-        cap_world = transform_pose("cam2", {"x": req.circle_x, "y": req.circle_y, "z": 0.0,
+        cap_world = transform_pose("cam2", {"x": req.circle_x, "y": req.circle_y, "z": req.circle_z,
                                               "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0}, "arm2_origin")
         grip_world = transform_pose("gripper2", {"x": 0, "y": 0, "z": 0, "o_x": 0, "o_y": 0, "o_z": 1, "theta": 0}, "arm2_origin")
         end = end_position("arm2")
@@ -802,7 +896,8 @@ def api_align_plan(req: AlignPlan) -> dict[str, Any]:
 
 
 @app.post("/api/align/move")
-def api_align_move(req: AlignPlan) -> dict[str, str]:
+@motion_endpoint
+def api_align_move(req: AlignPlan) -> dict[str, Any]:
     try:
         plan = api_align_plan(req)
         move_position("arm2",
@@ -816,6 +911,17 @@ def api_align_move(req: AlignPlan) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Camera: annotated preview images
 # ---------------------------------------------------------------------------
+@app.get("/api/camera/{name}/frame")
+def api_depth_frame(name: str) -> dict[str, Any]:
+    import cv2
+    cap = capture_frame(name, name, "arm2" if name == "cam2" else "arm")
+    if cap["depth"] is None:
+        raise HTTPException(status_code=400, detail="Camera did not return depth")
+    rgb = _cap_vision.colorize_depth(cap["depth"])
+    ok, enc = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return {"jpeg_base64": base64.b64encode(enc.tobytes()).decode("ascii") if ok else None}
+
+
 @app.get("/api/camera/{name}/preview")
 def api_camera_preview(name: str) -> dict[str, Any]:
     import base64
@@ -835,8 +941,15 @@ def api_yolo_preview(confidence: float = 0.65, show_all: bool = False) -> dict[s
     import base64
     import cv2
     try:
-        from yolo_grab import preview as yg_preview
-        img, count = yg_preview(viam_run, _get_robot(), "cam", confidence=confidence, show_all=show_all)
+        jpg = camera_frame("cam")
+        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+        detections = [d for d in yolo_detect(YOLO_DEFAULTS["service"], jpg) if d["confidence"] >= confidence]
+        bottles = sorted((d for d in detections if d["class_name"].lower() == "bottle"), key=lambda d: d["x_min"] + d["x_max"])
+        count = len(bottles)
+        for d in (detections if show_all else bottles):
+            color = (0, 255, 0) if bottles and d is bottles[0] else (0, 200, 255)
+            cv2.rectangle(img, (int(d["x_min"]), int(d["y_min"])), (int(d["x_max"]), int(d["y_max"])), color, 2)
+            cv2.putText(img, f"{d['class_name']}: {d['confidence']:.0%}", (int(d["x_min"]), max(20, int(d["y_min"]))), cv2.FONT_HERSHEY_SIMPLEX, .7, color, 2)
         ok, enc = cv2.imencode(".jpg", img)
         return {"jpeg_base64": base64.b64encode(enc.tobytes()).decode("ascii") if ok else None, "count": count}
     except Exception as exc:
@@ -848,5 +961,5 @@ def api_yolo_preview(confidence: float = 0.65, show_all: bool = False) -> dict[s
 # ---------------------------------------------------------------------------
 
 @app.get("/api/health")
-def api_health() -> dict[str, str]:
+def api_health() -> dict[str, Any]:
     return {"status": "ok"}

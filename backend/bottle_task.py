@@ -17,7 +17,7 @@ POSE_KEYS = ("x", "y", "z", "o_x", "o_y", "o_z", "theta")
 
 def go_to_keyframe(arm_name: str, kf: dict):
     """Joint keyframes ("values") move in joint space. XYZ keyframes ("pose") go through the motion planner."""
-    if "pose" in kf:
+    if kf.get("pose") is not None:
         p = kf["pose"]
         move_position(arm_name, float(p["x"]), float(p["y"]), float(p["z"]),
                       float(p["o_x"]), float(p["o_y"]), float(p["o_z"]), float(p["theta"]))
@@ -64,7 +64,6 @@ class BottleTask:
         self._halt()
         if self._thread is not None:
             self._thread.join(timeout=10)
-        self._thread = None
 
     # ---------- internals ----------
     def _set(self, **kw):

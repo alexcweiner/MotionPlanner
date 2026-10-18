@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from robot import (
-    capture_frame, yolo_detect, world_point, _surface_to_world,
+    capture_frame, yolo_detect, world_point, _surface_to_world, _strip_depth,
     joints, end_position, move_joint_positions, move_position, gripper_action,
     arm_do_command, gripper_do_command, RIGS,
 )
@@ -29,6 +29,8 @@ DEFAULTS = {
     "pre_mm": 100.0,
     "stroke_mm": 84.0,
     "bottle_diam_mm": 80.0,
+    "bottle_h_mm": 304.8,   # Saratoga 28 fl oz, bottom to cap top (same as cap_line_search.BOTTLE_HEIGHT_MM)
+    "size_tol": 0.25,       # drop a frame whose depth makes the bottle more than this fraction off that height
     "max_width_mm": 115.0,
     "finger_mm": 12.0,
     "grip_half_h_mm": 40.0,
@@ -117,9 +119,21 @@ def _bottle(cap, d, cfg, radius, W, H):
                                              ("right", d["x_max"] >= W - 3), ("bottom", d["y_max"] >= H - 3)) if cut]}
 
 
+def _size_mismatch(b, cfg):
+    """Why this frame's depth can't be right, or None. The bottle's height in mm follows from its box height and
+    the depth used, so depth read through the glass (the background behind it) makes it far too tall. Skipped when
+    the box is cut off at the top or bottom; locate() backs up for that."""
+    if {"top", "bottom"} & set(b["edges"]):
+        return None
+    h, H = float(np.linalg.norm(np.asarray(b["top"]) - np.asarray(b["bottom"]))), cfg["bottle_h_mm"]
+    if abs(h / H - 1) > cfg["size_tol"]:
+        return f"depth {b['z']:.0f} mm makes the bottle {h:.0f} mm tall (it is {H:.0f})"
+    return None
+
+
 def frame_axes(arm_name, cam_frame, grip_frame):
-    o = world_point(cam_frame)
-    ax = [(world_point(cam_frame, *a) - o) / 100.0 for a in ((100, 0, 0), (0, 100, 0), (0, 0, 100))]
+    o = world_point(grip_frame)
+    ax = [(world_point(grip_frame, *a) - o) / 100.0 for a in ((100, 0, 0), (0, 100, 0), (0, 0, 100))]
     return {"origin": o, "x": ax[0], "y": ax[1], "z": ax[2]}
 
 
@@ -128,7 +142,7 @@ def measure(arm_name, cam_name, cam_frame, grip_frame, cfg, check=None):
     import base64
     import io
     joints_before = list(joints(arm_name))
-    per, last = [], None
+    per, last, dropped = [], None, []
     for _ in range(int(cfg["frames"])):
         if check:
             check()
@@ -144,6 +158,11 @@ def measure(arm_name, cam_name, cam_frame, grip_frame, cfg, check=None):
         last = (cap, bottles)
         t = _bottle(cap, bottles[0], cfg, cfg["radius"], W, H) if bottles else None
         n = _bottle(cap, bottles[1], cfg, 0.0, W, H) if len(bottles) > 1 else None
+        if t is not None and (why := _size_mismatch(t, cfg)):
+            dropped.append(why)
+            t = None
+        if n is not None and _size_mismatch(n, cfg):
+            n = None
         per.append({"target": t, "neighbor": n, "count": len(bottles)} if t else None)
     if np.max(np.abs(np.array(joints(arm_name)) - joints_before)) > 0.2:
         raise ValueError("The arm moved while measuring; measure again with the arm still.")
@@ -151,7 +170,8 @@ def measure(arm_name, cam_name, cam_frame, grip_frame, cfg, check=None):
     need = max(2, int(cfg["frames"]) // 2 + 1)
     if len(good) < need:
         raise ValueError(f"The leftmost bottle had usable depth in only {len(good)} of {int(cfg['frames'])} frames "
-                         f"(need {need}). Check the bottle is in view and 25-120 cm from the camera.")
+                         f"(need {need}). Check the bottle is in view and 25-120 cm from the camera."
+                         + (f" Dropped: {'; '.join(dropped)}." if dropped else ""))
 
     def med(key, who="target"):
         vals = [p[who][key] for p in good if p[who] is not None]
@@ -166,6 +186,7 @@ def measure(arm_name, cam_name, cam_frame, grip_frame, cfg, check=None):
            "depth_spread": float(med("spread")), "conf": float(med("conf")),
            "clipped_edges": sorted({edge for p in good for edge in p["target"]["edges"]}),
            "counts": [p["count"] for p in good],
+           "z_frames": [float(p["target"]["z"]) for p in good], "dropped": dropped,
            "neighbor": None, "joints": joints_before}
     out["profile"] = {f: float(np.median(v)) for f in PROFILE
                       if len(v := [p["target"]["profile"][f] for p in good if f in p["target"]["profile"]]) >= need}
@@ -219,10 +240,12 @@ def plan(m, cfg):
     if p["turn_deg"] > 10:
         c.append(("error", f"Levelling would turn the gripper {p['turn_deg']:.0f}°; over the 10° limit."))
     if m["frames"] < m["of"]:
-        c.append(("warn", f"Bottle measured in {m['frames']}/{m['of']} frames."))
+        c.append(("warn", f"Bottle measured in {m['frames']}/{m['of']} frames."
+                          + (f" Dropped: {'; '.join(m['dropped'])}." if m.get("dropped") else "")))
     if m["spread_mm"] > cfg["max_spread_mm"]:
+        zs = ", ".join(f"{v:.0f}" for v in m.get("z_frames", []))
         c.append(("error", f"Frames disagree by {m['spread_mm']:.0f} mm (limit {cfg['max_spread_mm']:.0f}); "
-                           "detection is unstable. Nothing will move."))
+                           f"detection is unstable (depth per frame: {zs} mm). Nothing will move."))
     if m["clipped"]:
         c.append(("error", f"The leftmost bottle touches the {', '.join(m['clipped_edges'])} edge of the image, "
                            "so its box may be cut off."))
@@ -294,7 +317,7 @@ def annotate(m, p):
 # ---------- gripper attitude ----------
 def _Rz(a):
     c, s = math.cos(a), math.sin(a)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, c]])
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 def _Ry(a):
